@@ -157,6 +157,12 @@ void updateStatusLED() {
     ledMode = LED_WHITE;
   }
 
+  // Recording indication takes priority after the startup rainbow.
+  if (recordingActive) {
+    setRGB(170, 0, 255);
+    return;
+  }
+
   // Treat missing radar frames after the startup grace period as an error.
   const bool radarFault =
     now - bootStartedAt > 20000 &&
@@ -172,9 +178,9 @@ void updateStatusLED() {
     return;
   }
 
-  // BLE client connected: purple.
+  // BLE client connected: blue when not recording.
   if (bleClientConnected) {
-    setRGB(150, 0, 255);
+    setRGB(0, 100, 255);
     return;
   }
 
@@ -386,18 +392,25 @@ void updateRadar() {
   float rawDistance = 0.0f;
   if (mmWave.getDistance(rawDistance)) {
     if (isfinite(rawDistance) && rawDistance > 0.0f) {
-      // Assumption: library distance is metres; convert to centimetres.
-      distance = rawDistance * 100.0f;
-      distanceValid = true;
-      targetDetected = true;
-      lastDistance = now;
-      receivedAny = true;
+      // The previous x100 conversion produced values such as 4000 cm.
+      // Treat the library value as centimetres and reject out-of-range data.
+      // Verify this unit against measured distances on the actual sensor.
+      if (rawDistance >= 1.0f && rawDistance <= 600.0f) {
+        distance = rawDistance;
+        distanceValid = true;
+        targetDetected = true;
+        lastDistance = now;
+        receivedAny = true;
 
-      Serial.print("Radar raw distance: ");
-      Serial.print(rawDistance, 3);
-      Serial.print(" | distance: ");
-      Serial.print(distance, 1);
-      Serial.println(" cm");
+        Serial.print("Radar raw distance: ");
+        Serial.print(rawDistance, 3);
+        Serial.print(" | displayed distance: ");
+        Serial.print(distance, 1);
+        Serial.println(" cm");
+      } else {
+        Serial.print("Ignoring implausible raw distance: ");
+        Serial.println(rawDistance, 3);
+      }
     }
   }
 
@@ -739,179 +752,190 @@ void updateBLE() {
 void handleRoot() {
   String html = R"HTML(
 <!doctype html>
-<html>
+<html lang="uk">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MR60BHA2</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#090d18">
+<title>MR60BHA2 · Monitor</title>
 <style>
+:root {
+  color-scheme: dark;
+  --bg:#090d18; --panel:rgba(22,30,49,.68); --line:rgba(255,255,255,.12);
+  --text:#f3f6ff; --muted:#9ca9c5; --cyan:#8be9fd; --violet:#c4a7ff;
+}
+* { box-sizing:border-box; }
 body {
-  font-family: Arial;
-  background: #111;
-  color: #fff;
-  max-width: 720px;
-  margin: auto;
-  padding: 18px;
+  margin:0; min-height:100vh; padding:clamp(16px,4vw,34px);
+  color:var(--text); font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  background:radial-gradient(ellipse at 10% 0%,rgba(75,94,190,.25),transparent 42%),
+             radial-gradient(ellipse at 95% 25%,rgba(137,69,211,.17),transparent 35%),var(--bg);
 }
-section {
-  background: #222;
-  padding: 16px;
-  border-radius: 12px;
-  margin: 14px 0;
-}
-input, button, select {
-  box-sizing: border-box;
-  width: 100%;
-  padding: 12px;
-  margin: 6px 0;
-  font-size: 16px;
-}
-pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-a { color: #8ab4ff; }
-.app-button {
-  display: block;
-  box-sizing: border-box;
-  width: 100%;
-  padding: 12px;
-  margin: 6px 0;
-  border-radius: 8px;
-  background: #1769aa;
-  color: #fff;
-  text-align: center;
-  text-decoration: none;
-}
+main { width:100%; max-width:900px; margin:0 auto; }
+header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:8px 0 24px; }
+.brand { display:flex; align-items:center; gap:13px; }
+.logo { width:46px;height:46px;display:grid;place-items:center;border:1px solid var(--line);border-radius:15px;background:linear-gradient(135deg,rgba(139,233,253,.2),rgba(196,167,255,.16));font-size:23px; }
+h1 { font-size:clamp(24px,5vw,34px); margin:0; letter-spacing:-.04em; }
+.subtitle { color:var(--muted); margin-top:4px; font-size:13px; }
+.pill { border:1px solid var(--line); background:rgba(255,255,255,.05); border-radius:999px;padding:8px 11px;color:var(--muted);font-size:12px;white-space:nowrap; }
+.grid { display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px; }
+section { min-width:0; margin:14px 0; padding:20px; border:1px solid var(--line); border-radius:22px; background:var(--panel); backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);box-shadow:0 16px 50px rgba(0,0,0,.16); }
+.metric { min-height:142px; margin:0; }
+.metric .label { color:var(--muted);font-size:13px; }
+.metric .value { font-size:clamp(28px,5vw,40px);font-weight:720;letter-spacing:-.04em;margin:18px 0 4px;overflow-wrap:anywhere; }
+.unit { color:var(--muted);font-size:12px;font-weight:500;letter-spacing:0; }
+.section-title { margin:0 0 14px;font-size:16px;letter-spacing:-.02em; }
+.small { color:var(--muted);font-size:13px;line-height:1.55; }
+input,select { width:100%;padding:13px 14px;margin:6px 0 10px;border:1px solid var(--line);border-radius:13px;background:rgba(4,8,18,.52);color:var(--text);font-size:15px;outline:none; }
+input:focus,select:focus { border-color:rgba(139,233,253,.65);box-shadow:0 0 0 3px rgba(139,233,253,.08); }
+button,.glass-button { display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:45px;padding:12px 15px;margin:6px 0;border:1px solid rgba(255,255,255,.19);border-radius:14px;background:rgba(255,255,255,.075);color:var(--text);font-size:14px;font-weight:650;text-align:center;text-decoration:none;cursor:pointer;transition:background .18s ease,border-color .18s ease,transform .18s ease;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px); }
+button:hover,.glass-button:hover { background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.32); }
+button:active,.glass-button:active { transform:scale(.99); }
+.primary { background:rgba(115,111,255,.20);border-color:rgba(171,160,255,.36); }
+.primary:hover { background:rgba(115,111,255,.3); }
+.stop { background:rgba(255,90,120,.13);border-color:rgba(255,120,145,.35); }
+.app-buttons { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px; }
+.app-button { background:rgba(255,255,255,.065);border-color:rgba(255,255,255,.2);min-height:52px; }
+pre { margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:#d7e2ff;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.status-line { display:flex;align-items:center;gap:9px;color:var(--muted);font-size:13px;margin:8px 0; }
+.dot { width:8px;height:8px;border-radius:50%;background:#64748b;box-shadow:0 0 12px currentColor;flex:none; }
+.dot.on { background:#4ade80;color:#4ade80; }
+.dot.off { background:#fbbf24;color:#fbbf24; }
+.recording-state { color:var(--violet);font-weight:650; }
+footer { text-align:center;color:#77829c;font-size:12px;padding:18px 0 8px; }
+@media(max-width:650px) { .grid {grid-template-columns:1fr;}.metric {min-height:auto;} .metric .value {margin:12px 0 3px;} header {align-items:flex-start;} .pill {display:none;} section {padding:17px;border-radius:18px;} }
+@media(max-width:420px) { .app-buttons {grid-template-columns:1fr;} }
 </style>
 </head>
 <body>
+<main>
+<header>
+  <div class="brand"><div class="logo">⌁</div><div><h1>MR60BHA2</h1><div class="subtitle">Radar health monitor · XIAO ESP32-C6</div></div></div>
+  <div class="pill">LIVE MONITOR</div>
+</header>
 
-<h1>MR60BHA2</h1>
+<div class="grid">
+  <section class="metric"><div class="label">Пульс</div><div class="value"><span id="heart">—</span> <span class="unit">уд/хв</span></div><div class="small" id="heart-state">Очікування даних</div></section>
+  <section class="metric"><div class="label">Дихання</div><div class="value"><span id="breath">—</span> <span class="unit">вдихів/хв</span></div><div class="small" id="breath-state">Очікування даних</div></section>
+  <section class="metric"><div class="label">Відстань</div><div class="value"><span id="distance">—</span> <span class="unit">см</span></div><div class="small" id="target-state">Ціль не визначена</div></section>
+</div>
 
 <section>
-<h2>Device status</h2>
-<pre id="status">Loading...</pre>
+  <h2 class="section-title">Стан пристрою</h2>
+  <div class="status-line"><span id="wifi-dot" class="dot off"></span><span id="wifi-state">Wi-Fi: перевірка…</span></div>
+  <div class="status-line"><span id="ble-dot" class="dot off"></span><span id="ble-state">Bluetooth: перевірка…</span></div>
+  <div class="status-line"><span id="rec-dot" class="dot off"></span><span id="record-state">Запис зупинено</span></div>
+  <pre id="device-details">Завантаження статусу…</pre>
 </section>
 
 <section>
-<h2>Wi-Fi setup</h2>
-<button onclick="scan()">Scan Wi-Fi networks</button>
-<select id="nets"
- onchange="document.getElementById('ssid').value=this.value">
-<option value="">Select network...</option>
-</select>
-<input id="ssid" placeholder="Wi-Fi SSID">
-<input id="password" type="password" placeholder="Wi-Fi password">
-<button onclick="connectWiFi()">Save and connect</button>
-<pre id="result"></pre>
+  <h2 class="section-title">Запис вимірювань</h2>
+  <p class="small">Запис зберігається у внутрішній пам’яті пристрою. Завантаження CSV через сайт вимкнено.</p>
+  <button id="record-button" class="primary" onclick="toggleRecording()">● Почати запис</button>
+  <button class="glass-button" onclick="clearRecords()">Очистити збережені дані</button>
+  <div id="record-result" class="small" aria-live="polite"></div>
 </section>
 
 <section>
-<h2>Sensor data</h2>
-<pre id="sensor">Loading...</pre>
-<p><a href="/records.csv">Download saved CSV records</a></p>
-<button onclick="clearRecords()">Clear saved records</button>
+  <h2 class="section-title">Налаштування Wi-Fi</h2>
+  <button class="glass-button" onclick="scan()">⌕ Знайти мережі Wi-Fi</button>
+  <select id="nets" onchange="document.getElementById('ssid').value=this.value"><option value="">Оберіть мережу…</option></select>
+  <input id="ssid" placeholder="Назва мережі (SSID)" autocomplete="off">
+  <input id="password" type="password" placeholder="Пароль Wi-Fi" autocomplete="new-password">
+  <button class="primary" onclick="connectWiFi()">Зберегти та підключитися</button>
+  <button class="glass-button" onclick="resetWiFi()">Скинути налаштування Wi-Fi</button>
+  <div id="result" class="small" aria-live="polite"></div>
 </section>
 
 <section>
-<h2>BLE information</h2>
-<pre id="ble">Loading...</pre>
-<p><a class="app-button" href="https://play.google.com/store/apps/details?id=no.nordicsemi.android.mcp" target="_blank" rel="noopener">Download nRF Connect for Android</a></p>
-<p><a class="app-button" href="https://apps.apple.com/us/app/nrf-connect-for-mobile/id1054362403" target="_blank" rel="noopener">Download nRF Connect for iPhone</a></p>
+  <h2 class="section-title">Застосунок Bluetooth</h2>
+  <p class="small">Встанови nRF Connect, щоб знайти пристрій, підключитися через BLE та переглядати сповіщення сенсора.</p>
+  <div class="app-buttons">
+    <a class="glass-button app-button" href="https://play.google.com/store/apps/details?id=no.nordicsemi.android.mcp" target="_blank" rel="noopener">↗ Для Android</a>
+    <a class="glass-button app-button" href="https://apps.apple.com/us/app/nrf-connect-for-mobile/id1054362403" target="_blank" rel="noopener">↗ Для iPhone</a>
+  </div>
+  <p class="small">BLE-пристрій: <b>XIAO-C6</b></p>
 </section>
-
+<footer>MR60BHA2 · локальний інтерфейс пристрою</footer>
+</main>
 <script>
-async function get(path) {
-  let r = await fetch(path);
-  return await r.json();
+async function api(path, options) {
+  const r = await fetch(path, options || {});
+  let data = {};
+  try { data = await r.json(); } catch(e) {}
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
 }
-
+function setDot(id,on) { const el=document.getElementById(id); el.className='dot '+(on?'on':'off'); }
 async function refresh() {
   try {
-    document.getElementById('status').textContent =
-      JSON.stringify(await get('/api/device'), null, 2);
-
-    document.getElementById('sensor').textContent =
-      JSON.stringify(await get('/api/sensor'), null, 2);
-
-    document.getElementById('ble').textContent =
-      JSON.stringify(await get('/api/ble'), null, 2);
+    const [d,dev,ble]=await Promise.all([api('/api/sensor'),api('/api/device'),api('/api/ble')]);
+    document.getElementById('heart').textContent=d.heart_valid?Number(d.heart).toFixed(0):'—';
+    document.getElementById('breath').textContent=d.breath_valid?Number(d.breath).toFixed(0):'—';
+    document.getElementById('distance').textContent=d.distance_valid?Number(d.distance).toFixed(1):'—';
+    document.getElementById('heart-state').textContent=d.heart_valid?'Сигнал отримано':'Немає достовірного сигналу';
+    document.getElementById('breath-state').textContent=d.breath_valid?'Сигнал отримано':'Немає достовірного сигналу';
+    document.getElementById('target-state').textContent=d.target?'Ціль виявлена':'Ціль не визначена';
+    setDot('wifi-dot',d.wifi_connected); setDot('ble-dot',d.ble_connected); setDot('rec-dot',d.recording);
+    document.getElementById('wifi-state').textContent=d.wifi_connected?'Wi-Fi підключено':'Wi-Fi не підключено';
+    document.getElementById('ble-state').textContent=d.ble_connected?'Bluetooth BLE підключено':'Bluetooth очікує підключення';
+    const rec=document.getElementById('record-state');
+    rec.textContent=d.recording?'● Запис активний — світлодіод пурпурний':'Запис зупинено';
+    rec.className=d.recording?'recording-state':'';
+    const b=document.getElementById('record-button');
+    b.textContent=d.recording?'■ Зупинити запис':'● Почати запис';
+    b.className=d.recording?'stop':'primary';
+    let lines=[];
+    lines.push('Пристрій: '+(dev.name||'MR60BHA2'));
+    lines.push('Точка налаштування: '+(dev.ap_ssid||'—'));
+    lines.push('Адреса точки доступу: http://'+(dev.ap_ip||'192.168.4.1'));
+    lines.push('IP у Wi-Fi мережі: '+(dev.wifi_ip||'не отримано'));
+    lines.push('Пам’ять запису: '+(dev.storage_ready?'готова':'недоступна'));
+    document.getElementById('device-details').textContent=lines.join('\n');
   } catch(e) {
-    document.getElementById('status').textContent =
-      'Device temporarily unavailable';
+    document.getElementById('device-details').textContent='Пристрій тимчасово недоступний';
   }
 }
-
+async function toggleRecording() {
+  const b=document.getElementById('record-button'); b.disabled=true;
+  try {
+    const d=await api('/api/recording/toggle',{method:'POST'});
+    document.getElementById('record-result').textContent=d.message||'Стан запису змінено';
+    await refresh();
+  } catch(e) { document.getElementById('record-result').textContent='Не вдалося змінити запис: '+e.message; }
+  finally { b.disabled=false; }
+}
 async function clearRecords() {
-  if (!confirm('Delete all saved records?')) return;
-
-  try {
-    let r = await fetch('/api/records/clear', {method:'POST'});
-    document.getElementById('result').textContent =
-      JSON.stringify(await r.json(), null, 2);
-  } catch(e) {
-    document.getElementById('result').textContent = 'Clear failed';
-  }
+  if (!confirm('Очистити всі збережені дані запису?')) return;
+  try { const d=await api('/api/records/clear',{method:'POST'}); document.getElementById('record-result').textContent=d.status==='cleared'?'Збережені дані очищено':'Готово'; }
+  catch(e) { document.getElementById('record-result').textContent='Помилка: '+e.message; }
 }
-
 async function scan() {
-  document.getElementById('result').textContent = 'Scanning...';
-
+  document.getElementById('result').textContent='Сканування мереж…';
   try {
-    let a = await get('/api/wifi/scan');
-    let s = document.getElementById('nets');
-
-    s.innerHTML = '<option value="">Select network...</option>';
-
-    a.forEach(n => {
-      let o = document.createElement('option');
-      o.value = n.ssid;
-      o.textContent = n.ssid + ' (' + n.rssi + ' dBm)';
-      s.appendChild(o);
-    });
-
-    document.getElementById('result').textContent =
-      a.length + ' networks found';
-  } catch(e) {
-    document.getElementById('result').textContent = 'Scan failed';
-  }
+    const a=await api('/api/wifi/scan'); const sel=document.getElementById('nets');
+    sel.innerHTML='<option value="">Оберіть мережу…</option>';
+    a.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)';sel.appendChild(o);});
+    document.getElementById('result').textContent='Знайдено мереж: '+a.length;
+  } catch(e) { document.getElementById('result').textContent='Не вдалося просканувати Wi-Fi: '+e.message; }
 }
-
 async function connectWiFi() {
-  let ssid = document.getElementById('ssid').value;
-  let password = document.getElementById('password').value;
-
-  if (!ssid) {
-    document.getElementById('result').textContent =
-      'Enter Wi-Fi SSID';
-    return;
-  }
-
-  let b = 'ssid=' + encodeURIComponent(ssid) +
-          '&password=' + encodeURIComponent(password);
-
+  const ssid=document.getElementById('ssid').value;
+  const password=document.getElementById('password').value;
+  if(!ssid.trim()){document.getElementById('result').textContent='Введи назву Wi-Fi мережі';return;}
+  const body='ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password);
   try {
-    let r = await fetch('/api/wifi/config', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: b
-    });
-
-    document.getElementById('result').textContent =
-      JSON.stringify(await r.json(), null, 2);
-  } catch(e) {
-    document.getElementById('result').textContent =
-      'The device may be reconnecting. Check its serial log and IP address.';
-  }
+    const d=await api('/api/wifi/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+    document.getElementById('result').textContent=d.message||'Дані збережено. Пристрій підключається…';
+  } catch(e) { document.getElementById('result').textContent='Підключення могло перезапуститися. Перевір IP пристрою. ('+e.message+')'; }
 }
-
-setInterval(refresh, 2000);
-refresh();
+async function resetWiFi() {
+  if(!confirm('Скинути збережені налаштування Wi-Fi?'))return;
+  try { await api('/api/wifi/reset',{method:'POST'}); document.getElementById('result').textContent='Налаштування скидаються…'; }
+  catch(e) { document.getElementById('result').textContent='Пристрій перезапускається або вже недоступний.'; }
+}
+setInterval(refresh,1500); refresh();
 </script>
-
 </body>
 </html>
 )HTML";
@@ -1076,38 +1100,36 @@ void handleSensor() {
   server.send(200, "application/json", getSensorJSON());
 }
 
-void handleRecordsDownload() {
-  if (!filesystemReady ||
-      !LittleFS.exists(RECORD_FILE)) {
-
-    server.send(
-      503,
-      "text/plain",
-      "Flash storage is not ready"
-    );
-
+void handleRecordingToggle() {
+  if (!filesystemReady) {
+    server.send(503, "application/json", "{\"error\":\"storage unavailable\"}");
     return;
   }
 
-  File f = LittleFS.open(RECORD_FILE, FILE_READ);
+  recordingActive = !recordingActive;
+  preferences.begin("session", false);
+  preferences.putBool("active", recordingActive);
+  preferences.end();
 
-  if (!f) {
-    server.send(
-      500,
-      "text/plain",
-      "Cannot open records file"
-    );
-
-    return;
+  if (recordingActive) {
+    lastRecordWrite = 0;
+    if (!LittleFS.exists(RECORD_FILE)) {
+      File f = LittleFS.open(RECORD_FILE, FILE_WRITE);
+      if (f) {
+        f.println("elapsed_ms,heart_rate_bpm,breath_rate_bpm,distance,target,heart_valid,breath_valid,distance_valid");
+        f.close();
+      }
+    }
   }
 
-  server.sendHeader(
-    "Content-Disposition",
-    "attachment; filename=MR60BHA2_records.csv"
-  );
+  String json = "{\"recording\":";
+  json += recordingActive ? "true" : "false";
+  json += ",\"message\":\"";
+  json += recordingActive ? "Запис розпочато" : "Запис зупинено";
+  json += "\"}";
+  server.send(200, "application/json", json);
 
-  server.streamFile(f, "text/csv");
-  f.close();
+  Serial.println(recordingActive ? "Recording started from web UI" : "Recording stopped from web UI");
 }
 
 void handleRecordsClear() {
@@ -1194,7 +1216,7 @@ void startWebServer() {
 
   server.on(
     "/api/wifi/reset",
-    HTTP_GET,
+    HTTP_POST,
     handleWiFiReset
   );
 
@@ -1211,15 +1233,15 @@ void startWebServer() {
   );
 
   server.on(
-    "/records.csv",
-    HTTP_GET,
-    handleRecordsDownload
-  );
-
-  server.on(
     "/api/records/clear",
     HTTP_POST,
     handleRecordsClear
+  );
+
+  server.on(
+    "/api/recording/toggle",
+    HTTP_POST,
+    handleRecordingToggle
   );
 
   server.begin();
