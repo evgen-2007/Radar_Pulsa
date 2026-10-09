@@ -1,518 +1,536 @@
 
 #include <Arduino.h>
+#include <HardwareSerial.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include <HardwareSerial.h>
 #include <NimBLEDevice.h>
-#include <Adafruit_NeoPixel.h>
-#include "Seeed_Arduino_mmWave.h"
 
 // ============================================================
 // XIAO ESP32-C6 + MR60BHA2
-// Wi-Fi + Web UI + BLE control + sensor measurements + RGB LED
+// Wi-Fi, setup AP, web server, BLE JSON, status LED
+// nRF Connect link included in Bluetooth section
 // ============================================================
 
-// ---------------- LED ----------------
-#define LED_PIN D1
-#define LED_COUNT 1
-#define LED_BRIGHTNESS 60
+#define DEVICE_NAME       "MR60BHA2"
+#define BLE_DEVICE_NAME   "XIAO-C6"
 
-Adafruit_NeoPixel pixels(
-  LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800
-);
+#define BLE_SERVICE_UUID        "7a1e0001-8b4f-4d2a-9c21-1234567890ab"
+#define BLE_CHARACTERISTIC_UUID "7a1e0002-8b4f-4d2a-9c21-1234567890ab"
 
-// ---------------- RADAR ----------------
-// The official Seeed example uses HardwareSerial(0) on ESP32.
-// Check the selected board's USB/serial configuration if needed.
-HardwareSerial mmWaveSerial(0);
-SEEED_MR60BHA2 mmWave;
+static const int LED_PIN = 15;
+static const bool LED_ACTIVE_LOW = true;
 
-// ---------------- WIFI ----------------
+HardwareSerial radarSerial(0);
+
 WebServer server(80);
-Preferences prefs;
+Preferences preferences;
 
-const char* AP_NAME = "XIAO-MR60-Setup";
-const char* AP_PASS = "MR60setup26";
+String savedSSID;
+String savedPassword;
+String apName;
 
-String wifiSSID;
-String wifiPassword;
+bool provisioningMode = false;
+bool wifiConnected = false;
+bool bleStarted = false;
+bool bleClientConnected = false;
 
-bool wifiAttemptStarted = false;
-bool wifiTimeoutReported = false;
-uint32_t wifiStartAt = 0;
+unsigned long lastWiFiAttempt = 0;
+unsigned long wifiConnectStarted = 0;
+unsigned long lastBLENotify = 0;
+unsigned long lastLEDUpdate = 0;
+unsigned long lastWiFiStatusPrint = 0;
 
-// ---------------- BLE ----------------
-static const char* BLE_NAME = "XIAO-C6";
+const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
+const unsigned long WIFI_RETRY_INTERVAL = 10000;
+const unsigned long BLE_NOTIFY_INTERVAL = 1000;
 
-static const char* SERVICE_UUID =
-  "7a1e0001-8b4f-4d2a-9c21-1234567890ab";
+NimBLEServer *bleServer = nullptr;
+NimBLEService *bleService = nullptr;
+NimBLECharacteristic *bleCharacteristic = nullptr;
 
-static const char* CHARACTERISTIC_UUID =
-  "7a1e0002-8b4f-4d2a-9c21-1234567890ab";
+float breathRate = 0.0f;
+float heartRate = 0.0f;
+float distance = 0.0f;
 
-NimBLECharacteristic* bleCharacteristic = nullptr;
-
-volatile bool bleConnected = false;
-volatile bool bleCommandPending = false;
-String pendingBleCommand;
-
-// ---------------- MEASUREMENT ----------------
-enum RecordMode {
-  RECORD_STOPPED,
-  RECORD_WIFI,
-  RECORD_BLE
-};
-
-RecordMode recordMode = RECORD_STOPPED;
-
-float heartRate = 0;
-float breathRate = 0;
-float distanceMeters = 0;
-
-bool heartValid = false;
-bool breathValid = false;
-bool distanceValid = false;
 bool targetDetected = false;
+bool breathValid = false;
+bool heartValid = false;
+bool distanceValid = false;
 
-uint32_t lastNotifyAt = 0;
-uint32_t lastStatusAt = 0;
+unsigned long lastBreath = 0;
+unsigned long lastHeart = 0;
+unsigned long lastDistance = 0;
 
-// ---------------- LED STATES ----------------
-enum LedMode {
-  LED_STARTUP,
-  LED_READY,
-  LED_WIFI_RECORDING,
-  LED_BLE_RECORDING,
-  LED_ERROR,
-  LED_FINISHED
+uint8_t header[8];
+uint8_t dataBuf[64];
+
+int headerPos = 0;
+uint16_t dataLen = 0;
+uint16_t frameType = 0;
+int dataPos = 0;
+
+enum ParserState {
+  WAIT_SOF,
+  READ_HEADER,
+  READ_DATA,
+  READ_CHECKSUM
 };
 
-LedMode ledMode = LED_STARTUP;
-
-struct RGB {
-  uint8_t r;
-  uint8_t g;
-  uint8_t b;
-};
-
-const RGB rainbow[] = {
-  {255,   0,   0},  // Red
-  {255,  70,   0},  // Orange
-  {255, 255,   0},  // Yellow
-  {  0, 255,   0},  // Green
-  {  0, 255, 255},  // Cyan
-  {  0,   0, 255},  // Blue
-  {128,   0, 255},  // Purple
-  {255,   0, 255},  // Magenta
-  {255, 255, 255}   // White
-};
-
-const int RAINBOW_COUNT = sizeof(rainbow) / sizeof(rainbow[0]);
-
-uint32_t ledStartedAt = 0;
-uint32_t lastLedFrameAt = 0;
-uint32_t finishFlashAt = 0;
-
-const uint32_t WHITE_TIME_MS = 600;
-const uint32_t FADE_TIME_MS = 350;
-const uint32_t FINISH_FLASH_MS = 500;
+ParserState parserState = WAIT_SOF;
 
 // ============================================================
 // LED
 // ============================================================
 
-void showRGB(uint8_t r, uint8_t g, uint8_t b) {
-  pixels.setPixelColor(0, pixels.Color(r, g, b));
-  pixels.show();
+void setLED(bool on) {
+  digitalWrite(
+    LED_PIN,
+    (on ^ LED_ACTIVE_LOW) ? HIGH : LOW
+  );
 }
 
-RGB blend(const RGB& a, const RGB& b, float t) {
-  if (t < 0) t = 0;
-  if (t > 1) t = 1;
+void updateStatusLED() {
+  unsigned long now = millis();
 
-  RGB out;
-  out.r = (uint8_t)(a.r + ((int)b.r - a.r) * t);
-  out.g = (uint8_t)(a.g + ((int)b.g - a.g) * t);
-  out.b = (uint8_t)(a.b + ((int)b.b - a.b) * t);
-  return out;
-}
-
-void setLedMode(LedMode mode) {
-  ledMode = mode;
-  ledStartedAt = millis();
-
-  switch (mode) {
-    case LED_STARTUP:
-      showRGB(255, 255, 255);
-      Serial.println("LED: WHITE startup");
-      break;
-
-    case LED_READY:
-      showRGB(255, 0, 255);
-      Serial.println("LED: MAGENTA ready");
-      break;
-
-    case LED_WIFI_RECORDING:
-      showRGB(0, 255, 0);
-      Serial.println("LED: GREEN Wi-Fi assessment");
-      break;
-
-    case LED_BLE_RECORDING:
-      showRGB(128, 0, 255);
-      Serial.println("LED: PURPLE BLE assessment");
-      break;
-
-    case LED_ERROR:
-      showRGB(255, 0, 0);
-      Serial.println("LED: RED error");
-      break;
-
-    case LED_FINISHED:
-      finishFlashAt = millis();
-      showRGB(0, 255, 255);
-      Serial.println("LED: CYAN finished");
-      break;
-  }
-}
-
-void updateLed() {
-  uint32_t now = millis();
-
-  if (now - lastLedFrameAt < 20) return;
-  lastLedFrameAt = now;
-
-  if (ledMode == LED_STARTUP) {
-    uint32_t elapsed = now - ledStartedAt;
-
-    // First show pure white.
-    if (elapsed < WHITE_TIME_MS) {
-      showRGB(255, 255, 255);
-      return;
-    }
-
-    elapsed -= WHITE_TIME_MS;
-
-    uint32_t animationLength =
-      (RAINBOW_COUNT - 1) * FADE_TIME_MS;
-
-    if (elapsed >= animationLength) {
-      setLedMode(LED_READY);
-      return;
-    }
-
-    int segment = elapsed / FADE_TIME_MS;
-    uint32_t segmentTime = elapsed % FADE_TIME_MS;
-    float t = (float)segmentTime / FADE_TIME_MS;
-
-    RGB c = blend(rainbow[segment], rainbow[segment + 1], t);
-    showRGB(c.r, c.g, c.b);
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    setLED(true);
     return;
   }
 
-  if (ledMode == LED_FINISHED) {
-    if (now - finishFlashAt >= FINISH_FLASH_MS) {
-      setLedMode(LED_READY);
+  unsigned long interval = provisioningMode ? 700 : 180;
+
+  if (now - lastLEDUpdate >= interval) {
+    lastLEDUpdate = now;
+
+    static bool ledState = false;
+    ledState = !ledState;
+
+    setLED(ledState);
+  }
+}
+
+// ============================================================
+// RADAR UART PARSER
+// ============================================================
+
+float bytesToFloat(const uint8_t *p) {
+  union {
+    uint8_t b[4];
+    float f;
+  } u;
+
+  u.b[0] = p[0];
+  u.b[1] = p[1];
+  u.b[2] = p[2];
+  u.b[3] = p[3];
+
+  return u.f;
+}
+
+void resetParser() {
+  headerPos = 0;
+  dataLen = 0;
+  frameType = 0;
+  dataPos = 0;
+  parserState = WAIT_SOF;
+}
+
+void processFrame() {
+  if (frameType == 0x0A14 && dataLen >= 4) {
+    breathRate = bytesToFloat(dataBuf);
+    breathValid = true;
+    lastBreath = millis();
+  }
+  else if (frameType == 0x0A15 && dataLen >= 4) {
+    heartRate = bytesToFloat(dataBuf);
+    heartValid = true;
+    lastHeart = millis();
+  }
+  else if (frameType == 0x0A16 && dataLen >= 8) {
+    uint32_t flag =
+      ((uint32_t)dataBuf[0]) |
+      ((uint32_t)dataBuf[1] << 8) |
+      ((uint32_t)dataBuf[2] << 16) |
+      ((uint32_t)dataBuf[3] << 24);
+
+    distance = bytesToFloat(&dataBuf[4]);
+    targetDetected = (flag != 0);
+    distanceValid = targetDetected;
+    lastDistance = millis();
+  }
+}
+
+void parseByte(uint8_t b) {
+  switch (parserState) {
+    case WAIT_SOF:
+      if (b == 0x01) {
+        header[0] = b;
+        headerPos = 1;
+        parserState = READ_HEADER;
+      }
+      break;
+
+    case READ_HEADER:
+      if (headerPos < 8) {
+        header[headerPos++] = b;
+      }
+
+      if (headerPos >= 8) {
+        dataLen =
+          ((uint16_t)header[3] << 8) |
+          header[4];
+
+        frameType =
+          ((uint16_t)header[5] << 8) |
+          header[6];
+
+        if (dataLen > sizeof(dataBuf)) {
+          resetParser();
+          break;
+        }
+
+        dataPos = 0;
+
+        parserState =
+          (dataLen == 0) ? READ_CHECKSUM : READ_DATA;
+      }
+      break;
+
+    case READ_DATA:
+      if (dataPos < (int)sizeof(dataBuf)) {
+        dataBuf[dataPos++] = b;
+      }
+
+      if (dataPos >= dataLen) {
+        parserState = READ_CHECKSUM;
+      }
+      break;
+
+    case READ_CHECKSUM:
+      processFrame();
+      resetParser();
+      break;
+  }
+}
+
+// ============================================================
+// WI-FI CONFIGURATION
+// ============================================================
+
+String getAPName() {
+  uint64_t chipID = ESP.getEfuseMac();
+
+  char suffix[5];
+
+  snprintf(
+    suffix,
+    sizeof(suffix),
+    "%04X",
+    (uint16_t)(chipID & 0xFFFF)
+  );
+
+  return String("MR60BHA2-") + suffix;
+}
+
+void loadWiFiCredentials() {
+  preferences.begin("wifi", true);
+
+  savedSSID = preferences.getString("ssid", "");
+  savedPassword = preferences.getString("password", "");
+
+  preferences.end();
+
+  Serial.print("Saved SSID: ");
+  Serial.println(
+    savedSSID.length() ? savedSSID : "NONE"
+  );
+}
+
+void saveWiFiCredentials(
+  const String &ssid,
+  const String &password
+) {
+  preferences.begin("wifi", false);
+
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+
+  preferences.end();
+
+  savedSSID = ssid;
+  savedPassword = password;
+
+  Serial.println("Wi-Fi credentials saved");
+}
+
+void clearWiFiCredentials() {
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.end();
+
+  savedSSID = "";
+  savedPassword = "";
+
+  Serial.println("Wi-Fi credentials erased");
+}
+
+void startProvisioningAP() {
+  Serial.println("Starting configuration access point...");
+
+  apName = getAPName();
+
+  WiFi.mode(WIFI_AP_STA);
+
+  bool ok = WiFi.softAP(
+    apName.c_str(),
+    "MR60setup"
+  );
+
+  provisioningMode = ok;
+
+  if (ok) {
+    Serial.print("AP SSID: ");
+    Serial.println(apName);
+
+    Serial.println("AP password: MR60setup");
+
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+
+    Serial.println(
+      "Open http://192.168.4.1 to configure Wi-Fi"
+    );
+  }
+  else {
+    Serial.println(
+      "ERROR: could not start configuration AP"
+    );
+  }
+}
+
+bool connectToSavedWiFi(bool waitForResult = true) {
+  if (!savedSSID.length()) {
+    return false;
+  }
+
+  Serial.println("Connecting to saved Wi-Fi...");
+  Serial.print("SSID: ");
+  Serial.println(savedSSID);
+
+  WiFi.mode(
+    provisioningMode ? WIFI_AP_STA : WIFI_STA
+  );
+
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
+  WiFi.begin(
+    savedSSID.c_str(),
+    savedPassword.c_str()
+  );
+
+  wifiConnectStarted = millis();
+  lastWiFiAttempt = millis();
+
+  if (waitForResult) {
+    while (
+      WiFi.status() != WL_CONNECTED &&
+      millis() - wifiConnectStarted < WIFI_CONNECT_TIMEOUT
+    ) {
+      delay(250);
+      Serial.print('.');
     }
-  }
-}
 
-// ============================================================
-// MEASUREMENT STATE
-// ============================================================
-
-void startAssessment(RecordMode mode) {
-  recordMode = mode;
-
-  if (mode == RECORD_WIFI) {
-    setLedMode(LED_WIFI_RECORDING);
-    Serial.println("Assessment started via Wi-Fi");
-  } else if (mode == RECORD_BLE) {
-    setLedMode(LED_BLE_RECORDING);
-    Serial.println("Assessment started via BLE");
-  }
-}
-
-void stopAssessment() {
-  if (recordMode == RECORD_STOPPED) return;
-
-  recordMode = RECORD_STOPPED;
-  setLedMode(LED_FINISHED);
-  Serial.println("Assessment stopped");
-}
-
-// ============================================================
-// JSON
-// ============================================================
-
-String sensorJson() {
-  String s = "{";
-
-  s += "\"target\":";
-  s += targetDetected ? "true" : "false";
-
-  s += ",\"heart\":";
-  s += String(heartRate, 1);
-
-  s += ",\"heart_valid\":";
-  s += heartValid ? "true" : "false";
-
-  s += ",\"breath\":";
-  s += String(breathRate, 1);
-
-  s += ",\"breath_valid\":";
-  s += breathValid ? "true" : "false";
-
-  s += ",\"distance\":";
-  s += String(distanceMeters, 2);
-
-  s += ",\"distance_valid\":";
-  s += distanceValid ? "true" : "false";
-
-  s += ",\"recording\":";
-  s += recordMode != RECORD_STOPPED ? "true" : "false";
-
-  s += ",\"record_mode\":\"";
-  if (recordMode == RECORD_WIFI) s += "wifi";
-  else if (recordMode == RECORD_BLE) s += "ble";
-  else s += "stop";
-  s += "\"";
-
-  s += ",\"wifi_connected\":";
-  s += WiFi.status() == WL_CONNECTED ? "true" : "false";
-
-  s += ",\"ble_connected\":";
-  s += bleConnected ? "true" : "false";
-
-  s += "}";
-  return s;
-}
-
-String deviceJson() {
-  String s = "{";
-
-  s += "\"device\":\"XIAO-C6\",";
-  s += "\"radar\":\"MR60BHA2\",";
-  s += "\"wifi_connected\":";
-  s += WiFi.status() == WL_CONNECTED ? "true" : "false";
-
-  s += ",\"wifi_ssid\":\"";
-  s += WiFi.SSID();
-  s += "\"";
-
-  s += ",\"wifi_ip\":\"";
-  s += WiFi.localIP().toString();
-  s += "\"";
-
-  s += ",\"ap_ip\":\"";
-  s += WiFi.softAPIP().toString();
-  s += "\"";
-
-  s += ",\"ble_connected\":";
-  s += bleConnected ? "true" : "false";
-
-  s += "}";
-  return s;
-}
-
-// ============================================================
-// SENSOR UPDATE - OFFICIAL SEEED LIBRARY
-// ============================================================
-
-void updateRadar() {
-  if (!mmWave.update(10)) return;
-
-  float value;
-
-  if (mmWave.getHeartRate(value)) {
-    heartRate = value;
-    heartValid = (value > 0 && value < 250);
+    Serial.println();
   }
 
-  if (mmWave.getBreathRate(value)) {
-    breathRate = value;
-    breathValid = (value > 0 && value < 100);
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+
+    Serial.println("Wi-Fi CONNECTED!");
+
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+
+    if (provisioningMode) {
+      WiFi.softAPdisconnect(true);
+      provisioningMode = false;
+      WiFi.mode(WIFI_STA);
+    }
+
+    return true;
   }
 
-  if (mmWave.getDistance(value)) {
-    distanceMeters = value;
-    distanceValid = (value > 0 && value < 20);
-  }
+  wifiConnected = false;
 
-  targetDetected = mmWave.isHumanDetected();
+  Serial.println(
+    "Wi-Fi not connected yet; retry will continue in background."
+  );
+
+  return false;
 }
 
 // ============================================================
-// BLE CALLBACKS
-// NimBLE-Arduino 2.x
+// SENSOR JSON
 // ============================================================
 
-class MyServerCallbacks : public NimBLEServerCallbacks {
+String getSensorJSON() {
+  unsigned long now = millis();
+
+  bool target =
+    targetDetected &&
+    (now - lastDistance < 3000);
+
+  bool breath =
+    breathValid &&
+    (now - lastBreath < 5000) &&
+    breathRate > 0;
+
+  bool heart =
+    heartValid &&
+    (now - lastHeart < 5000) &&
+    heartRate > 0;
+
+  bool dist =
+    distanceValid &&
+    (now - lastDistance < 3000);
+
+  String json = "{";
+
+  json += "\"target\":";
+  json += target ? "true" : "false";
+
+  json += ",\"heart\":";
+  json += String(heartRate, 2);
+
+  json += ",\"heart_valid\":";
+  json += heart ? "true" : "false";
+
+  json += ",\"breath\":";
+  json += String(breathRate, 2);
+
+  json += ",\"breath_valid\":";
+  json += breath ? "true" : "false";
+
+  json += ",\"distance\":";
+  json += String(distance, 2);
+
+  json += ",\"distance_valid\":";
+  json += dist ? "true" : "false";
+
+  json += "}";
+
+  return json;
+}
+
+// ============================================================
+// BLE
+// ============================================================
+
+class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(
-    NimBLEServer* server,
-    NimBLEConnInfo& connInfo
+    NimBLEServer *server,
+    NimBLEConnInfo &info
   ) override {
-    bleConnected = true;
-    Serial.println("BLE connected");
+    bleClientConnected = true;
+    Serial.println("BLE client connected");
   }
 
   void onDisconnect(
-    NimBLEServer* server,
-    NimBLEConnInfo& connInfo,
+    NimBLEServer *server,
+    NimBLEConnInfo &info,
     int reason
   ) override {
-    bleConnected = false;
-    Serial.println("BLE disconnected");
+    bleClientConnected = false;
+
+    Serial.println(
+      "BLE client disconnected; restarting advertising"
+    );
+
     NimBLEDevice::startAdvertising();
   }
 };
 
-class MyCharacteristicCallbacks :
-  public NimBLECharacteristicCallbacks {
+void startBLE() {
+  Serial.println();
+  Serial.println("--------------------------------");
+  Serial.println("STARTING BLUETOOTH BLE");
+  Serial.println("--------------------------------");
 
-  void onWrite(
-    NimBLECharacteristic* characteristic,
-    NimBLEConnInfo& connInfo
-  ) override {
-    std::string raw = characteristic->getValue();
-    String command = String(raw.c_str());
-    command.trim();
-    command.toUpperCase();
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-    // Defer state changes to loop().
-    pendingBleCommand = command;
-    bleCommandPending = true;
-  }
-};
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCallbacks());
 
-void setupBLE() {
-  NimBLEDevice::init(BLE_NAME);
+  bleService = bleServer->createService(
+    BLE_SERVICE_UUID
+  );
 
-  NimBLEServer* serverBLE = NimBLEDevice::createServer();
-  serverBLE->setCallbacks(new MyServerCallbacks());
-
-  NimBLEService* service = serverBLE->createService(SERVICE_UUID);
-
-  bleCharacteristic = service->createCharacteristic(
-    CHARACTERISTIC_UUID,
+  bleCharacteristic = bleService->createCharacteristic(
+    BLE_CHARACTERISTIC_UUID,
     NIMBLE_PROPERTY::READ |
-    NIMBLE_PROPERTY::WRITE |
-    NIMBLE_PROPERTY::WRITE_NR |
     NIMBLE_PROPERTY::NOTIFY
   );
 
-  bleCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
-  bleCharacteristic->setValue("{\"status\":\"ready\"}");
+  bleCharacteristic->setValue(
+    "{\"status\":\"starting\"}"
+  );
 
-  service->start();
+  bleService->start();
 
-  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
-  advertising->addServiceUUID(SERVICE_UUID);
-  advertising->setName(BLE_NAME);
-  advertising->start();
+  NimBLEAdvertising *advertising =
+    NimBLEDevice::getAdvertising();
 
-  Serial.println("BLE advertising started");
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setName(BLE_DEVICE_NAME);
+  advertising->enableScanResponse(true);
+
+  bool advOK = advertising->start();
+
+  bleStarted = advOK;
+
+  Serial.println(
+    advOK
+      ? "BLE ADVERTISING STARTED"
+      : "ERROR: BLE advertising failed"
+  );
+
   Serial.print("BLE name: ");
-  Serial.println(BLE_NAME);
+  Serial.println(BLE_DEVICE_NAME);
+
+  Serial.print("BLE service UUID: ");
+  Serial.println(BLE_SERVICE_UUID);
+
+  Serial.print("BLE characteristic UUID: ");
+  Serial.println(BLE_CHARACTERISTIC_UUID);
+
+  Serial.println("--------------------------------");
 }
 
-void processBleCommand() {
-  if (!bleCommandPending) return;
-
-  String command = pendingBleCommand;
-  bleCommandPending = false;
-
-  if (command == "START") {
-    startAssessment(RECORD_BLE);
-  } else if (command == "STOP") {
-    stopAssessment();
-  } else if (command == "STATUS") {
-    // Status will be sent by the next notification.
-  } else {
-    Serial.print("Unknown BLE command: ");
-    Serial.println(command);
-  }
-}
-
-void updateBleNotifications() {
-  if (!bleConnected || bleCharacteristic == nullptr) return;
-
-  uint32_t now = millis();
-  if (now - lastNotifyAt < 500) return;
-
-  lastNotifyAt = now;
-
-  String s = sensorJson();
-  bleCharacteristic->setValue(s.c_str());
-  bleCharacteristic->notify();
-}
-
-// ============================================================
-// WIFI CREDENTIALS / CONNECTION
-// ============================================================
-
-void loadCredentials() {
-  prefs.begin("wifi", true);
-  wifiSSID = prefs.getString("ssid", "");
-  wifiPassword = prefs.getString("password", "");
-  prefs.end();
-}
-
-void saveCredentials(const String& ssid, const String& password) {
-  prefs.begin("wifi", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("password", password);
-  prefs.end();
-}
-
-void setupWiFi() {
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setAutoReconnect(true);
-
-  // Keep setup access available even when router connection works.
-  bool apStarted = WiFi.softAP(AP_NAME, AP_PASS);
-
-  Serial.println(apStarted ? "Setup AP started" : "Setup AP failed");
-  Serial.print("Setup SSID: ");
-  Serial.println(AP_NAME);
-  Serial.print("Setup password: ");
-  Serial.println(AP_PASS);
-  Serial.print("Setup URL: http://");
-  Serial.println(WiFi.softAPIP());
-
-  loadCredentials();
-
-  if (wifiSSID.length() == 0) {
-    Serial.println("No saved router credentials");
+void updateBLE() {
+  if (!bleStarted || !bleCharacteristic) {
     return;
   }
 
-  Serial.print("Connecting to router: ");
-  Serial.println(wifiSSID);
+  unsigned long now = millis();
 
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-
-  wifiAttemptStarted = true;
-  wifiStartAt = millis();
-}
-
-void checkWiFi() {
-  if (!wifiAttemptStarted) return;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!wifiTimeoutReported) {
-      wifiTimeoutReported = true;
-      Serial.println("Router Wi-Fi connected");
-      Serial.print("Router IP: ");
-      Serial.println(WiFi.localIP());
-    }
+  if (now - lastBLENotify < BLE_NOTIFY_INTERVAL) {
     return;
   }
 
-  if (!wifiTimeoutReported && millis() - wifiStartAt > 15000) {
-    wifiTimeoutReported = true;
-    Serial.println("Router connection timed out.");
-    Serial.println("Setup AP remains available.");
+  lastBLENotify = now;
+
+  String json = getSensorJSON();
+
+  bleCharacteristic->setValue(json.c_str());
+
+  if (bleClientConnected) {
+    bleCharacteristic->notify();
   }
 }
 
@@ -520,278 +538,448 @@ void checkWiFi() {
 // WEB PAGE
 // ============================================================
 
-String makeWebPage() {
-  String p = R"HTML(
+void handleRoot() {
+  String html = R"HTML(
 <!doctype html>
-<html lang="en">
+<html lang="uk">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MR60BHA2 Control</title>
+<title>MR60BHA2</title>
+
 <style>
-body{font-family:Arial,sans-serif;margin:18px;max-width:760px;background:#f5f6f8;color:#222}
-.card{background:white;padding:16px;margin:12px 0;border-radius:12px;border:1px solid #ddd}
-button,input{font-size:16px;padding:10px;margin:5px 0;max-width:100%}
-button{cursor:pointer;border-radius:8px;border:1px solid #aaa;background:#eee}
-.primary{background:#dcecff}
-.stop{background:#ffe2e2}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f6f6f6;padding:10px;border-radius:8px}
-small{color:#555}
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: Arial, sans-serif;
+  background: #111;
+  color: #fff;
+  max-width: 720px;
+  margin: auto;
+  padding: 18px;
+}
+
+section {
+  background: #222;
+  padding: 16px;
+  border-radius: 12px;
+  margin: 14px 0;
+}
+
+h1 {
+  color: #c4b5fd;
+}
+
+h2 {
+  margin-top: 0;
+}
+
+input,
+button,
+select {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 12px;
+  margin: 6px 0;
+  font-size: 16px;
+  border-radius: 8px;
+}
+
+button {
+  color: white;
+  background: #55349b;
+  border: 1px solid #7954c7;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #6846b4;
+}
+
+input,
+select {
+  background: #171717;
+  color: white;
+  border: 1px solid #555;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #171717;
+  padding: 12px;
+  border-radius: 8px;
+}
+
+.app-link {
+  display: block;
+  margin-top: 10px;
+  padding: 12px;
+  text-align: center;
+  color: #c4b5fd;
+  background: #211832;
+  border: 1px solid #6744a3;
+  border-radius: 11px;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.app-link:hover {
+  background: #342453;
+}
+
+.note {
+  color: #bbb;
+  font-size: 13px;
+  line-height: 1.5;
+}
 </style>
 </head>
+
 <body>
-<h2>XIAO ESP32-C6 / MR60BHA2</h2>
+<h1>MR60BHA2</h1>
 
-<div class="card">
-<h3>Bluetooth control</h3>
-<p>Connect to the device over Bluetooth to receive measurements and control the assessment.</p>
-<button class="primary" onclick="connectBLE()">Connect Bluetooth</button>
-<button class="primary" onclick="startBLE()" id="bleStart" disabled>Start assessment via BLE</button>
-<button class="stop" onclick="stopBLE()" id="bleStop" disabled>Stop assessment via BLE</button>
-<p id="bleStatus">Bluetooth not connected.</p>
-<small id="bleHint"></small>
-</div>
+<section>
+  <h2>Стан пристрою</h2>
+  <pre id="status">Завантаження...</pre>
+</section>
 
-<div class="card">
-<h3>Wi-Fi assessment control</h3>
-<button class="primary" onclick="apiRecord('wifi')">Start via Wi-Fi</button>
-<button class="stop" onclick="apiRecord('stop')">Stop assessment</button>
-<p><small>These controls use the device's HTTP API.</small></p>
-</div>
+<section>
+  <h2>Налаштування Wi-Fi</h2>
 
-<div class="card">
-<h3>Wi-Fi setup</h3>
-<form method="POST" action="/wifi/save">
-<label>Router SSID</label><br>
-<input name="ssid" required autocomplete="off"><br>
-<label>Router password</label><br>
-<input name="password" type="password" autocomplete="new-password"><br>
-<button type="submit">Save Wi-Fi credentials and restart</button>
-</form>
-</div>
+  <button onclick="scan()">
+    Знайти мережі Wi-Fi
+  </button>
 
-<div class="card">
-<h3>Live sensor data</h3>
-<pre id="sensor">Loading...</pre>
-</div>
+  <select id="nets"
+    onchange="document.getElementById('ssid').value=this.value">
+    <option value="">Виберіть мережу...</option>
+  </select>
 
-<div class="card">
-<h3>Device status</h3>
-<pre id="device">Loading...</pre>
-</div>
+  <input id="ssid" placeholder="Назва Wi-Fi (SSID)">
+
+  <input id="password"
+    type="password"
+    placeholder="Пароль Wi-Fi">
+
+  <button onclick="connectWiFi()">
+    Зберегти та підключитися
+  </button>
+
+  <pre id="result"></pre>
+
+  <p class="note">
+    Якщо пристрій перебуває в режимі налаштування,
+    відкрийте адресу http://192.168.4.1
+  </p>
+</section>
+
+<section>
+  <h2>Показники сенсора</h2>
+  <pre id="sensor">Завантаження...</pre>
+</section>
+
+<section>
+  <h2>Bluetooth BLE</h2>
+
+  <p>
+    Назва пристрою: <b>XIAO-C6</b>
+  </p>
+
+  <p class="note">
+    Для підключення до сенсора та перегляду BLE-характеристик
+    скористайтеся застосунком nRF Connect.
+  </p>
+
+  <a
+    href="https://play.google.com/store/apps/details?id=no.nordicsemi.android.mcp"
+    target="_blank"
+    rel="noopener noreferrer"
+    class="app-link">
+    ↗ Встановити nRF Connect із Google Play
+  </a>
+
+  <pre id="ble">Завантаження...</pre>
+</section>
 
 <script>
-let bleDevice = null;
-let bleServer = null;
-let bleCharacteristic = null;
-
-const serviceUUID = '7a1e0001-8b4f-4d2a-9c21-1234567890ab';
-const characteristicUUID = '7a1e0002-8b4f-4d2a-9c21-1234567890ab';
-
-function setBleStatus(message) {
-  document.getElementById('bleStatus').textContent = message;
+async function get(path) {
+  const response = await fetch(path);
+  return await response.json();
 }
 
-function updateBleButtons(connected) {
-  document.getElementById('bleStart').disabled = !connected;
-  document.getElementById('bleStop').disabled = !connected;
+async function refresh() {
+  try {
+    document.getElementById('status').textContent =
+      JSON.stringify(await get('/api/device'), null, 2);
+
+    document.getElementById('sensor').textContent =
+      JSON.stringify(await get('/api/sensor'), null, 2);
+
+    document.getElementById('ble').textContent =
+      JSON.stringify(await get('/api/ble'), null, 2);
+  } catch (error) {
+    document.getElementById('status').textContent =
+      'Пристрій тимчасово недоступний';
+  }
 }
 
-async function connectBLE() {
-  if (!navigator.bluetooth) {
-    setBleStatus('Web Bluetooth is unavailable in this browser or page context.');
-    document.getElementById('bleHint').textContent =
-      'Try a supported Chromium browser in a secure context, or use an Android BLE client.';
+async function scan() {
+  const result = document.getElementById('result');
+  result.textContent = 'Пошук мереж Wi-Fi...';
+
+  try {
+    const networks = await get('/api/wifi/scan');
+    const select = document.getElementById('nets');
+
+    select.innerHTML =
+      '<option value="">Виберіть мережу...</option>';
+
+    networks.forEach(network => {
+      const option = document.createElement('option');
+
+      option.value = network.ssid;
+      option.textContent =
+        network.ssid + ' (' + network.rssi + ' dBm)';
+
+      select.appendChild(option);
+    });
+
+    result.textContent =
+      'Знайдено мереж: ' + networks.length;
+  } catch (error) {
+    result.textContent = 'Не вдалося знайти мережі';
+  }
+}
+
+async function connectWiFi() {
+  const ssid = document.getElementById('ssid').value;
+  const password = document.getElementById('password').value;
+  const result = document.getElementById('result');
+
+  if (!ssid) {
+    result.textContent = 'Введіть назву мережі Wi-Fi';
     return;
   }
 
-  try {
-    setBleStatus('Choose XIAO-C6 in the Bluetooth picker...');
+  const body =
+    'ssid=' + encodeURIComponent(ssid) +
+    '&password=' + encodeURIComponent(password);
 
-    bleDevice = await navigator.bluetooth.requestDevice({
-      filters: [{name: 'XIAO-C6'}],
-      optionalServices: [serviceUUID]
+  try {
+    const response = await fetch('/api/wifi/config', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: body
     });
 
-    bleDevice.addEventListener('gattserverdisconnected', () => {
-      bleCharacteristic = null;
-      updateBleButtons(false);
-      setBleStatus('Bluetooth disconnected.');
-    });
-
-    bleServer = await bleDevice.gatt.connect();
-    const service = await bleServer.getPrimaryService(serviceUUID);
-    bleCharacteristic = await service.getCharacteristic(characteristicUUID);
-
-    await bleCharacteristic.startNotifications();
-    bleCharacteristic.addEventListener(
-      'characteristicvaluechanged',
-      event => {
-        const bytes = event.target.value;
-        const text = new TextDecoder().decode(bytes);
-        try {
-          document.getElementById('sensor').textContent =
-            JSON.stringify(JSON.parse(text), null, 2);
-        } catch (e) {
-          document.getElementById('sensor').textContent = text;
-        }
-      }
-    );
-
-    updateBleButtons(true);
-    setBleStatus('Connected to ' + bleDevice.name + ' over Bluetooth.');
-    document.getElementById('bleHint').textContent =
-      'Live measurements will appear below when notifications arrive.';
-  } catch (e) {
-    setBleStatus('Bluetooth connection failed: ' + e.message);
+    result.textContent =
+      JSON.stringify(await response.json(), null, 2);
+  } catch (error) {
+    result.textContent =
+      'Пристрій може перепідключатися до Wi-Fi. ' +
+      'Перевірте IP-адресу та повідомлення в Serial Monitor.';
   }
 }
 
-async function sendBLECommand(command) {
-  if (!bleCharacteristic) {
-    setBleStatus('Connect Bluetooth first.');
-    return;
-  }
-
-  try {
-    await bleCharacteristic.writeValue(new TextEncoder().encode(command));
-    setBleStatus('Bluetooth command sent: ' + command);
-  } catch (e) {
-    setBleStatus('Could not send command: ' + e.message);
-  }
-}
-
-function startBLE() {
-  sendBLECommand('START');
-}
-
-function stopBLE() {
-  sendBLECommand('STOP');
-}
-
-async function apiRecord(mode) {
-  try {
-    const response = await fetch('/api/record?mode=' + encodeURIComponent(mode),
-                                 {method:'POST'});
-    const result = await response.json();
-    document.getElementById('sensor').textContent =
-      JSON.stringify(result, null, 2);
-  } catch(e) {
-    alert('API error: ' + e.message);
-  }
-}
-
-async function refreshStatus() {
-  try {
-    const a = await fetch('/api/sensor');
-    document.getElementById('sensor').textContent =
-      JSON.stringify(await a.json(), null, 2);
-
-    const b = await fetch('/api/device');
-    document.getElementById('device').textContent =
-      JSON.stringify(await b.json(), null, 2);
-  } catch(e) {}
-}
-
-setInterval(refreshStatus, 1500);
-refreshStatus();
+setInterval(refresh, 2000);
+refresh();
 </script>
+
 </body>
 </html>
 )HTML";
 
-  return p;
+  server.send(
+    200,
+    "text/html; charset=utf-8",
+    html
+  );
 }
 
 // ============================================================
-// HTTP ROUTES
+// API
 // ============================================================
 
-void setupWebServer() {
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html; charset=utf-8", makeWebPage());
-  });
+void handleDevice() {
+  String json = "{";
 
-  server.on("/wifi/save", HTTP_POST, []() {
-    String ssid = server.arg("ssid");
-    String password = server.arg("password");
-    ssid.trim();
+  json += "\"name\":\"" + String(DEVICE_NAME) + "\",";
+  json += "\"ble_name\":\"" + String(BLE_DEVICE_NAME) + "\",";
+  json += "\"ble_started\":";
+  json += bleStarted ? "true" : "false";
 
-    if (ssid.length() == 0) {
-      server.send(400, "text/plain", "SSID is required");
-      return;
+  json += ",\"ap_ssid\":\"" + getAPName() + "\",";
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"wifi_connected\":";
+  json += WiFi.status() == WL_CONNECTED ? "true" : "false";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    json += ",\"wifi_ip\":\"" +
+      WiFi.localIP().toString() + "\"";
+
+    json += ",\"rssi\":" + String(WiFi.RSSI());
+  }
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleWiFiStatus() {
+  String ssid =
+    WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
+
+  String ip =
+    WiFi.status() == WL_CONNECTED
+      ? WiFi.localIP().toString()
+      : "";
+
+  String json =
+    "{\"connected\":" +
+    String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
+    ",\"ssid\":\"" + ssid +
+    "\",\"ip\":\"" + ip +
+    "\",\"rssi\":" +
+    String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) +
+    "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleWiFiScan() {
+  Serial.println("Wi-Fi scan started");
+
+  int count = WiFi.scanNetworks();
+
+  String json = "[";
+
+  for (int i = 0; i < count; i++) {
+    if (i) {
+      json += ",";
     }
 
-    saveCredentials(ssid, password);
+    String ssid = WiFi.SSID(i);
 
+    ssid.replace("\\", "\\\\");
+    ssid.replace("\"", "\\\"");
+
+    json += "{\"ssid\":\"" + ssid + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    json += "\"secured\":";
+    json +=
+      WiFi.encryptionType(i) == WIFI_AUTH_OPEN
+        ? "false"
+        : "true";
+    json += "}";
+  }
+
+  json += "]";
+
+  WiFi.scanDelete();
+
+  server.send(200, "application/json", json);
+}
+
+void handleWiFiConfig() {
+  if (
+    !server.hasArg("ssid") ||
+    !server.hasArg("password") ||
+    server.arg("ssid").length() == 0
+  ) {
     server.send(
-      200, "text/html; charset=utf-8",
-      "<html><body><h3>Credentials saved. Restarting...</h3></body></html>"
+      400,
+      "application/json",
+      "{\"error\":\"ssid and password required\"}"
     );
+    return;
+  }
 
-    delay(500);
-    ESP.restart();
-  });
+  saveWiFiCredentials(
+    server.arg("ssid"),
+    server.arg("password")
+  );
 
-  server.on("/api/sensor", HTTP_GET, []() {
-    server.send(200, "application/json", sensorJson());
-  });
+  if (!provisioningMode) {
+    apName = getAPName();
 
-  server.on("/api/device", HTTP_GET, []() {
-    server.send(200, "application/json", deviceJson());
-  });
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(apName.c_str(), "MR60setup");
 
-  server.on("/api/ble", HTTP_GET, []() {
-    String s = "{\"connected\":";
-    s += bleConnected ? "true" : "false";
-    s += ",\"name\":\"XIAO-C6\"}";
-    server.send(200, "application/json", s);
-  });
+    provisioningMode = true;
+  }
 
-  server.on("/api/wifi/status", HTTP_GET, []() {
-    server.send(200, "application/json", deviceJson());
-  });
+  server.send(
+    200,
+    "application/json",
+    "{\"status\":\"saved\",\"message\":\"Credentials saved; reconnecting to Wi-Fi.\"}"
+  );
 
-  auto recordHandler = []() {
-    String mode = server.arg("mode");
-    mode.toLowerCase();
+  delay(250);
 
-    if (mode == "wifi") {
-      startAssessment(RECORD_WIFI);
-    } else if (mode == "ble") {
-      startAssessment(RECORD_BLE);
-    } else if (mode == "stop") {
-      stopAssessment();
-    } else {
-      server.send(
-        400, "application/json",
-        "{\"error\":\"mode must be wifi, ble or stop\"}"
-      );
-      return;
-    }
+  connectToSavedWiFi(true);
 
-    server.send(200, "application/json", sensorJson());
-  };
+  if (!wifiConnected && !provisioningMode) {
+    startProvisioningAP();
+  }
+}
 
-  server.on("/api/record", HTTP_GET, recordHandler);
-  server.on("/api/record", HTTP_POST, recordHandler);
+void handleWiFiReset() {
+  clearWiFiCredentials();
 
-  server.on("/api/wifi/reset", HTTP_POST, []() {
-    prefs.begin("wifi", false);
-    prefs.remove("ssid");
-    prefs.remove("password");
-    prefs.end();
+  server.send(
+    200,
+    "application/json",
+    "{\"status\":\"reset\",\"message\":\"Wi-Fi credentials erased; restarting.\"}"
+  );
 
-    server.send(200, "text/plain", "Wi-Fi credentials cleared. Restarting.");
-    delay(300);
-    ESP.restart();
-  });
+  delay(500);
+  ESP.restart();
+}
 
-  server.onNotFound([]() {
-    server.send(404, "text/plain", "Not found");
-  });
+void handleSensor() {
+  server.send(
+    200,
+    "application/json",
+    getSensorJSON()
+  );
+}
+
+void handleBLE() {
+  String json =
+    "{\"started\":" +
+    String(bleStarted ? "true" : "false") +
+    ",\"connected\":" +
+    String(bleClientConnected ? "true" : "false") +
+    ",\"name\":\"" + String(BLE_DEVICE_NAME) +
+    "\",\"service_uuid\":\"" + String(BLE_SERVICE_UUID) +
+    "\",\"characteristic_uuid\":\"" +
+    String(BLE_CHARACTERISTIC_UUID) + "\"}";
+
+  server.send(200, "application/json", json);
+}
+
+// ============================================================
+// WEB SERVER
+// ============================================================
+
+void startWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+
+  server.on("/api/device", HTTP_GET, handleDevice);
+  server.on("/api/wifi/status", HTTP_GET, handleWiFiStatus);
+  server.on("/api/wifi/scan", HTTP_GET, handleWiFiScan);
+  server.on("/api/wifi/config", HTTP_POST, handleWiFiConfig);
+  server.on("/api/wifi/reset", HTTP_GET, handleWiFiReset);
+  server.on("/api/sensor", HTTP_GET, handleSensor);
+  server.on("/api/ble", HTTP_GET, handleBLE);
 
   server.begin();
+
   Serial.println("HTTP server started");
 }
 
@@ -800,52 +988,119 @@ void setupWebServer() {
 // ============================================================
 
 void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  setLED(false);
+
   Serial.begin(115200);
-  delay(150);
+  delay(1500);
 
   Serial.println();
-  Serial.println("====================================");
-  Serial.println("XIAO ESP32-C6 + MR60BHA2");
-  Serial.println("Wi-Fi + BLE + RGB LED");
-  Serial.println("====================================");
+  Serial.println("======================================");
+  Serial.println("MR60BHA2 SMART DEVICE - XIAO ESP32-C6");
+  Serial.println("======================================");
 
-  pixels.begin();
-  pixels.setBrightness(LED_BRIGHTNESS);
-  pixels.clear();
-  pixels.show();
+  radarSerial.begin(115200);
 
-  // White immediately, then non-blocking fade animation.
-  setLedMode(LED_STARTUP);
+  Serial.println("MR60BHA2 UART started (115200)");
 
-  // Use the official Seeed sensor library.
-  mmWave.begin(&mmWaveSerial);
-  Serial.println("MR60BHA2 library initialized");
+  apName = getAPName();
 
-  setupBLE();
-  setupWiFi();
-  setupWebServer();
+  loadWiFiCredentials();
 
-  Serial.println("Startup complete");
-  Serial.println("Open setup page at the printed AP IP.");
+  // Start BLE before Wi-Fi.
+  startBLE();
+
+  bool connected = connectToSavedWiFi(true);
+
+  if (!connected) {
+    startProvisioningAP();
+  }
+
+  startWebServer();
+
+  Serial.println("--------------------------------------");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("NORMAL WI-FI MODE");
+
+    Serial.print("Device IP: ");
+    Serial.println(WiFi.localIP());
+  }
+  else {
+    Serial.println("PROVISIONING / RETRY MODE");
+
+    Serial.print("Connect to AP: ");
+    Serial.println(getAPName());
+
+    Serial.println("Password: MR60setup");
+    Serial.println("Open: http://192.168.4.1");
+  }
+
+  Serial.print("BLE name: ");
+  Serial.println(BLE_DEVICE_NAME);
+
+  Serial.println("--------------------------------------");
 }
 
 // ============================================================
-// LOOP
+// MAIN LOOP
 // ============================================================
 
 void loop() {
-  updateRadar();
-
-  server.handleClient();
-  processBleCommand();
-  updateBleNotifications();
-  checkWiFi();
-  updateLed();
-
-  if (millis() - lastStatusAt >= 5000) {
-    lastStatusAt = millis();
-    Serial.println(sensorJson());
+  while (radarSerial.available()) {
+    parseByte((uint8_t)radarSerial.read());
   }
 
-  delay(1);
+  server.handleClient();
+
+  updateBLE();
+  updateStatusLED();
+
+  unsigned long now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+
+      Serial.print("Wi-Fi restored. IP address: ");
+      Serial.println(WiFi.localIP());
+
+      if (provisioningMode) {
+        WiFi.softAPdisconnect(true);
+        provisioningMode = false;
+        WiFi.mode(WIFI_STA);
+      }
+    }
+
+    if (now - lastWiFiStatusPrint > 30000) {
+      lastWiFiStatusPrint = now;
+
+      Serial.print("Wi-Fi OK, IP: ");
+      Serial.print(WiFi.localIP());
+
+      Serial.print(", RSSI: ");
+      Serial.println(WiFi.RSSI());
+    }
+  }
+  else {
+    if (wifiConnected) {
+      wifiConnected = false;
+
+      Serial.println(
+        "Wi-Fi connection lost; will retry automatically."
+      );
+
+      if (!provisioningMode) {
+        startProvisioningAP();
+      }
+    }
+
+    if (
+      savedSSID.length() &&
+      now - lastWiFiAttempt >= WIFI_RETRY_INTERVAL
+    ) {
+      Serial.println("Retrying saved Wi-Fi connection...");
+      connectToSavedWiFi(false);
+    }
+  }
 }
