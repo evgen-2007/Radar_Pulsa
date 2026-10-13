@@ -1,0 +1,28 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = "com.pulsbreath.app"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.pulsbreath.app"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+dependencies {
+    implementation "com.android.tools.lint:lint-gradle:31.7.3"
+    implementation "com.android.tools.build:aapt2:8.7.3-12006047:windows"
+}

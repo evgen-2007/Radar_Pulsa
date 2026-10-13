@@ -1,0 +1,31 @@
+plugins {
+    id 'application'
+    id 'org.openjfx.javafxplugin'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+javafx {
+    version = '17.0.2'
+    modules = ['javafx.controls']
+}
+
+dependencies {
+    implementation project(':core')
+    implementation 'org.xerial:sqlite-jdbc:3.45.1.0'
+
+    // Експорт архіву у справжній файл Excel (.xlsx)
+    implementation 'org.apache.poi:poi-ooxml:5.4.1'
+}
+
+application {
+    mainClass = 'com.pulsbreath.desktop.PulsBreathApp'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
