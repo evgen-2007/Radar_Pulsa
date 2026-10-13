@@ -1,6 +1,7 @@
 plugins {
     id 'application'
     id 'org.openjfx.javafxplugin'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
 }
 
 java {
@@ -11,7 +12,7 @@ java {
 
 javafx {
     version = '17.0.2'
-    modules = ['javafx.controls']
+    modules = [ 'javafx.controls', 'javafx.graphics', 'javafx.fxml', 'javafx.base' ]
 }
 
 dependencies {
@@ -24,8 +25,49 @@ dependencies {
 
 application {
     mainClass = 'com.pulsbreath.desktop.PulsBreathApp'
+    applicationDefaultJvmArgs = [
+        '--module-path', 'lib',
+        '--add-modules', 'javafx.controls,javafx.graphics,javafx.fxml,javafx.base'
+    ]
+}
+
+jar {
+    manifest {
+        attributes(
+            'Main-Class': 'com.pulsbreath.desktop.PulsBreathApp'
+        )
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+task copyDependencies(type: Copy) {
+    from configurations.runtimeClasspath
+    into "$buildDir/libs/all-libs"
+}
+
+task packageExe(type: Exec) {
+    dependsOn 'installDist'
+    
+    def outputDir = "$buildDir/installer"
+    def inputDir = "$buildDir/install/desktop/lib"
+    def javaHome = System.getProperty("java.home")
+    
+    // Перевірте, чи точно ваш основний jar називається 'desktop-1.0-SNAPSHOT.jar' 
+    // (якщо інша версія — змініть назву нижче)
+    def mainJarName = "desktop-1.0-SNAPSHOT.jar"
+
+    commandLine "$javaHome/bin/jpackage",
+        "--type", "app-image",
+        "--dest", outputDir,
+        "--name", "PulsBreath",
+        "--input", inputDir,
+        "--main-jar", mainJarName,
+        "--main-class", "com.pulsbreath.desktop.PulsBreathApp",
+        "--module-path", inputDir,
+        "--add-modules", "javafx.controls,javafx.graphics,javafx.fxml,javafx.base",
+        "--win-shortcut",
+        "--win-menu"
 }
