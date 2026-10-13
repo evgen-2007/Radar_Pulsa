@@ -55,8 +55,6 @@ task packageExe(type: Exec) {
     def inputDir = "$buildDir/install/desktop/lib"
     def javaHome = System.getProperty("java.home")
     
-    // Перевірте, чи точно ваш основний jar називається 'desktop-1.0-SNAPSHOT.jar' 
-    // (якщо інша версія — змініть назву нижче)
     def mainJarName = "desktop-1.0-SNAPSHOT.jar"
 
     commandLine "$javaHome/bin/jpackage",
